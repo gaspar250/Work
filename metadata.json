@@ -1,0 +1,9 @@
+{
+  "name": "MatchTask",
+  "description": "Trabalho imediato, local e informal. Encontre profissionais qualificados em minutos para tarefas rápidas.",
+  "requestFramePermissions": [
+    "geolocation",
+    "camera",
+    "microphone"
+  ]
+}

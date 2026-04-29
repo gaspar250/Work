@@ -1,0 +1,144 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 3. Path Variable Hardening & Global Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // 2. Validation Blueprints (Pillar 2)
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'name']) &&
+             data.uid is string && data.uid.size() > 0 &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 200 &&
+             (!data.keys().contains('phone') || (data.phone is string && data.phone.size() <= 20));
+    }
+
+    function isValidTask(data) {
+      return data.keys().hasAll(['clientId', 'title', 'status']) &&
+             data.clientId is string &&
+             data.title is string && data.title.size() > 0 && data.title.size() < 500 &&
+             data.status in ['pending', 'accepted', 'completed', 'cancelled'] &&
+             (!data.keys().contains('clientReminderSent') || data.clientReminderSent is bool) &&
+             (!data.keys().contains('providerReminderSent') || data.providerReminderSent is bool) &&
+             (!data.keys().contains('reminderSent') || data.reminderSent is bool);
+    }
+
+    function isValidMessage(data) {
+      return data.keys().hasAll(['chatId', 'senderId', 'text', 'type']) &&
+             data.chatId is string &&
+             data.senderId is string &&
+             data.text is string && data.text.size() > 0 && data.text.size() < 2000 &&
+             data.type in ['text', 'proposal'];
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll(['userId', 'title', 'body', 'type', 'read']) &&
+             data.userId is string &&
+             data.title is string &&
+             data.body is string &&
+             data.read is bool;
+    }
+
+    function isValidReview(data) {
+      return data.keys().hasAll(['taskId', 'clientId', 'providerId', 'rating']) &&
+             data.taskId is string &&
+             data.clientId is string &&
+             data.providerId is string &&
+             data.rating is number && data.rating >= 1 && data.rating <= 5;
+    }
+
+    function isValidJob(data) {
+      return data.keys().hasAll(['clientId', 'title', 'description', 'category']) &&
+             data.clientId is string &&
+             data.title is string && data.title.size() > 0 && data.title.size() < 200 &&
+             data.description is string && data.description.size() > 0 && data.description.size() < 2000 &&
+             data.category is string;
+    }
+
+    // 6. Rules with PII Isolation & Master Gates (Pillar 1/6)
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      
+      // Pillar 4: Tiered Identity Logic
+      allow update: if (isOwner(userId) && (
+        isValidUser(incoming()) || 
+        // Action: Status Update (Online/Offline)
+        incoming().diff(existing()).affectedKeys().hasAny(['isOnline', 'lastSeen'])
+      )) || (
+        // Action: Rating Update (Internal)
+        isSignedIn() && incoming().diff(existing()).affectedKeys().hasOnly(['rating', 'reviewCount'])
+      );
+
+      match /favorites/{providerId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    match /tasks/{taskId} {
+      allow read: if isSignedIn() && (request.auth.uid == resource.data.clientId || request.auth.uid == resource.data.providerId);
+      allow create: if isSignedIn() && isValidTask(incoming()) && (incoming().clientId == request.auth.uid || incoming().providerId == request.auth.uid);
+      allow update: if isSignedIn() && (request.auth.uid == resource.data.clientId || request.auth.uid == resource.data.providerId);
+    }
+
+    match /chats/{chatId} {
+      allow read: if isSignedIn() && request.auth.uid in resource.data.participants;
+      allow create: if isSignedIn() && request.auth.uid in incoming().participants;
+      allow update: if isSignedIn() && request.auth.uid in resource.data.participants;
+
+      match /messages/{messageId} {
+        allow read: if isSignedIn() && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+        
+        // Pillar 1: Master Gate (Relational Sync)
+        allow create: if isSignedIn() && 
+                      isValidMessage(incoming()) && 
+                      incoming().senderId == request.auth.uid &&
+                      request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+        
+        // Action-Based Update (Pillar 4)
+        allow update: if isSignedIn() && 
+                      incoming().diff(existing()).affectedKeys().hasOnly(['proposalStatus']) &&
+                      request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+      }
+    }
+
+    match /notifications/{notificationId} {
+      allow read: if isSignedIn() && request.auth.uid == resource.data.userId;
+      allow create: if isSignedIn() && isValidNotification(incoming());
+      allow update: if isSignedIn() && request.auth.uid == resource.data.userId && incoming().diff(existing()).affectedKeys().hasOnly(['read']);
+    }
+
+    match /reviews/{reviewId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidReview(incoming()) && incoming().clientId == request.auth.uid;
+    }
+
+    match /jobs/{jobId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidJob(incoming()) && incoming().clientId == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.clientId == request.auth.uid;
+    }
+  }
+}
